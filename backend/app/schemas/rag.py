@@ -1,6 +1,18 @@
 from pydantic import BaseModel
 
 
+class RepoFile(BaseModel):
+    file_path: str
+    content: str
+
+
+class RepoChunk(BaseModel):
+    file_path: str
+    chunk_id: str
+    chunk_index: int
+    content: str
+
+
 class RAGQuery(BaseModel):
     query: str
     purpose: str
