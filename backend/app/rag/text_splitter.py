@@ -1,6 +1,6 @@
 from app.schemas.rag import RepoChunk, RepoFile
 
-
+# chunking ho rha h yahan pe
 def split_repo_file(
     repo_file: RepoFile,
     chunk_size: int = 1200,
@@ -34,7 +34,7 @@ def split_repo_file(
 
     return chunks
 
-
+# ye bas valiudation krta h ki chunk size aur overlap sahi h ya nhi
 def _validate_split_settings(chunk_size: int, overlap: int) -> None:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")

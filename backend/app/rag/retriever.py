@@ -9,6 +9,9 @@ def retrieve_context_placeholder(query: str) -> list[str]:
         return []
     return ["RAG placeholder: real Elasticsearch retrieval will be implemented in a later phase."]
 
+# Query ka embedding banata hai.
+# Elasticsearch me same repo_name aur branch ke chunks search karta hai.
+# Top matching context chunks return karta hai.
 
 def retrieve_context(
     query: str,

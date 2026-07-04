@@ -11,7 +11,9 @@ INDEX_NAME = "pr-review-repo-context"
 def index_documents_placeholder(documents: list[str]) -> int:
     return len(documents)
 
-
+# ye function repo ke chunks ko index krta h elasticsearch me 
+# ensure krta h ki index exist krta h ya nhi agar nhi to create krta h
+# documment id generate krta h repo name, branch aur chunk id se aur phir bulk me index krta h
 def index_repo_chunks(repo_name: str, branch: str, chunks: list[RepoChunk]) -> int:
     if not chunks:
         return 0

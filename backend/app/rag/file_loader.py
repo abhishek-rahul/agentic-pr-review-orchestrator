@@ -7,7 +7,8 @@ SKIP_FOLDERS = {".git", ".venv", "__pycache__", ".pytest_cache", "node_modules",
 SKIP_FILE_NAMES = {".env"}
 SKIP_EXTENSIONS = {".pyc", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".zip"}
 
-
+#sare files me jao recursively air wahan jaek dekho agar ye null nhi h aur ismein content h to repo files me rakhte jao
+# iske phle ki tum ye dekho content h ya nhi tum file ka type bhi dekho whether allowed h ya nhi
 def load_repo_files(repo_path: str) -> list[RepoFile]:
     if not os.path.isdir(repo_path):
         raise ValueError(f"Repo path must be an existing directory: {repo_path}")
@@ -31,7 +32,7 @@ def load_repo_files(repo_path: str) -> list[RepoFile]:
 
     return repo_files
 
-
+# file allowed h ya nhi check krta h
 def _should_load_file(file_name: str) -> bool:
     lower_name = file_name.lower()
     _, extension = os.path.splitext(lower_name)
@@ -42,7 +43,7 @@ def _should_load_file(file_name: str) -> bool:
         return False
     return extension in ALLOWED_EXTENSIONS
 
-
+# file ka content read krta h agar content khali h load mat karo
 def _read_text_file(file_path: str) -> str | None:
     try:
         raw_content = open(file_path, "rb").read()

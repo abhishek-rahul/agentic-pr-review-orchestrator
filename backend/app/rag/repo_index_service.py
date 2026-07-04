@@ -5,7 +5,7 @@ from app.rag.indexer import index_repo_chunks
 from app.rag.text_splitter import split_repo_file
 from app.schemas.rag import RepoChunk
 
-
+# ye coordinator type h 
 def index_local_repo(repo_path: str, repo_name: str, branch: str = "main") -> int:
     if not os.path.isdir(repo_path):
         raise ValueError(f"Repo path must be an existing directory: {repo_path}")
