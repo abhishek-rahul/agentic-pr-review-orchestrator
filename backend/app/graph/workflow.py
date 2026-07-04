@@ -5,13 +5,13 @@ from app.graph.nodes import (
     diff_understanding_agent,
     eval_judge_agent,
     fetch_pr_data_node,
-    final_response_builder_agent,
     final_scoring_agent,
-    finding_guardrails_node,
+    finding_guardrail_node,
     parse_pr_url_node,
     pr_review_agent,
     rag_query_planner_agent,
     rag_retriever_node,
+    response_builder_node,
     risk_classification_agent,
 )
 from app.graph.state import PRReviewState
@@ -28,10 +28,10 @@ def build_review_graph():
     graph.add_node("rag_retriever", rag_retriever_node)
     graph.add_node("context_quality", context_quality_agent)
     graph.add_node("pr_review", pr_review_agent)
-    graph.add_node("finding_guardrails", finding_guardrails_node)
+    graph.add_node("finding_guardrail", finding_guardrail_node)
     graph.add_node("eval_judge", eval_judge_agent)
     graph.add_node("final_scoring", final_scoring_agent)
-    graph.add_node("final_response_builder", final_response_builder_agent)
+    graph.add_node("response_builder", response_builder_node)
 
     graph.add_edge(START, "parse_pr_url")
     graph.add_edge("parse_pr_url", "fetch_pr_data")
@@ -41,10 +41,10 @@ def build_review_graph():
     graph.add_edge("rag_query_planner", "rag_retriever")
     graph.add_edge("rag_retriever", "context_quality")
     graph.add_edge("context_quality", "pr_review")
-    graph.add_edge("pr_review", "finding_guardrails")
-    graph.add_edge("finding_guardrails", "eval_judge")
+    graph.add_edge("pr_review", "finding_guardrail")
+    graph.add_edge("finding_guardrail", "eval_judge")
     graph.add_edge("eval_judge", "final_scoring")
-    graph.add_edge("final_scoring", "final_response_builder")
-    graph.add_edge("final_response_builder", END)
+    graph.add_edge("final_scoring", "response_builder")
+    graph.add_edge("response_builder", END)
 
     return graph.compile()

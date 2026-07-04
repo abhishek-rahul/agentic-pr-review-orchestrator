@@ -1,4 +1,4 @@
-from typing import TypedDict
+from typing import Any, Literal, TypedDict
 
 from app.schemas.diff import DiffSummary
 from app.schemas.eval import EvalResult, GuardrailStatus
@@ -11,12 +11,17 @@ from app.schemas.trace import TraceStep
 
 class PRReviewState(TypedDict, total=False):
     request_id: str
+    workflow_mode: Literal["skeleton"] | str
     pr_url: str
     pr_goal: str | None
 
     pr_ref: PRRef
+    owner: str
+    repo: str
+    pr_number: int
     pr_metadata: PRMetadata
     changed_files: list[ChangedFile]
+    raw_diff: str
 
     diff_summary: DiffSummary
     risk_summary: RiskSummary
@@ -25,8 +30,11 @@ class PRReviewState(TypedDict, total=False):
     context_quality: ContextQualityResult
 
     findings: list[Finding]
+    guardrail_result: GuardrailStatus
     guardrails: GuardrailStatus
     eval_result: EvalResult
+    score_result: dict[str, Any]
+    final_response: dict[str, Any]
 
     overall_score: int
     confidence: int
@@ -34,4 +42,6 @@ class PRReviewState(TypedDict, total=False):
     recommendation: str
     final_summary: str
 
+    retry_count: dict[str, int]
+    errors: list[dict[str, str]]
     trace: list[TraceStep]

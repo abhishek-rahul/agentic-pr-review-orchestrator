@@ -11,6 +11,7 @@ from app.rag.retriever import retrieve_context_placeholder
 from app.schemas.diff import DiffSummary, FileChangeSummary
 from app.schemas.eval import GuardrailStatus
 from app.schemas.finding import Finding
+from app.schemas.pr import ChangedFile, PRMetadata
 from app.schemas.rag import ContextQualityResult, RAGQuery, RAGQueryPlan, RetrievedContext
 from app.schemas.risk import RiskSummary
 
@@ -19,18 +20,53 @@ TEST_HINTS = ("test", "spec")
 
 
 def parse_pr_url_node(state: PRReviewState) -> PRReviewState:
-    state["pr_ref"] = parse_pr_url(state["pr_url"])
-    add_trace(state, "S6.1", "parse_pr_url_node", "passed", "PR URL parsed")
+    pr_ref = parse_pr_url(state["pr_url"])
+    state["pr_ref"] = pr_ref
+    state["owner"] = pr_ref.owner
+    state["repo"] = pr_ref.repo
+    state["pr_number"] = pr_ref.pr_number
+    add_trace(state, "S5.1", "parse_pr_url_node", "passed", "PR URL parsed")
     return state
 
 
 async def fetch_pr_data_node(state: PRReviewState) -> PRReviewState:
     pr_ref = state["pr_ref"]
+    if state.get("workflow_mode") == "skeleton":
+        state["pr_metadata"] = PRMetadata(
+            title=f"Skeleton PR #{pr_ref.pr_number}",
+            author="skeleton",
+            base_branch="main",
+            head_branch="skeleton-step-5",
+            state="open",
+            additions=12,
+            deletions=3,
+            changed_files_count=1,
+        )
+        state["changed_files"] = [
+            ChangedFile(
+                filename="app/payment_service.py",
+                status="modified",
+                additions=12,
+                deletions=3,
+                patch="@@ skeleton diff @@\n+ placeholder payment change\n",
+            )
+        ]
+        state["raw_diff"] = "@@ skeleton diff @@\n+ placeholder payment change\n"
+        add_trace(
+            state,
+            "S5.2",
+            "fetch_pr_data_node",
+            "passed",
+            "Loaded skeleton PR data without GitHub API",
+        )
+        return state
+
     state["pr_metadata"] = await fetch_pr_metadata(pr_ref)
     state["changed_files"] = await fetch_changed_files(pr_ref)
+    state["raw_diff"] = "\n".join(file.patch or "" for file in state["changed_files"])
     add_trace(
         state,
-        "S6.2",
+        "S5.2",
         "fetch_pr_data_node",
         "passed",
         f"Fetched {len(state['changed_files'])} changed file(s) from GitHub",
@@ -74,7 +110,7 @@ def diff_understanding_agent(state: PRReviewState) -> PRReviewState:
     )
     add_trace(
         state,
-        "S6.3",
+        "S5.3",
         "diff_understanding_agent",
         "passed",
         f"Detected {main_change_type} in {main_area}",
@@ -103,7 +139,7 @@ def risk_classification_agent(state: PRReviewState) -> PRReviewState:
         risk_reasons=reasons,
         required_review_types=summary.required_review_types,
     )
-    add_trace(state, "S6.4", "risk_classification_agent", "passed", f"Risk classified as {risk}")
+    add_trace(state, "S5.4", "risk_classification_agent", "passed", f"Risk classified as {risk}")
     return state
 
 
@@ -113,7 +149,7 @@ def rag_query_planner_agent(state: PRReviewState) -> PRReviewState:
 
     if not summary.requires_rag:
         state["rag_query_plan"] = RAGQueryPlan(queries=[], top_k=0)
-        add_trace(state, "S6.5", "rag_query_planner_agent", "skipped", "RAG not required")
+        add_trace(state, "S5.5", "rag_query_planner_agent", "skipped", "RAG not required")
         return state
 
     changed_paths = " ".join(file.file_path for file in summary.files)
@@ -139,7 +175,7 @@ def rag_query_planner_agent(state: PRReviewState) -> PRReviewState:
         )
 
     state["rag_query_plan"] = RAGQueryPlan(queries=queries, top_k=6)
-    add_trace(state, "S6.5", "rag_query_planner_agent", "passed", f"Planned {len(queries)} RAG query(ies)")
+    add_trace(state, "S5.5", "rag_query_planner_agent", "passed", f"Planned {len(queries)} RAG query(ies)")
     return state
 
 
@@ -147,7 +183,7 @@ def rag_retriever_node(state: PRReviewState) -> PRReviewState:
     plan = state.get("rag_query_plan")
     if not plan or not plan.queries:
         state["retrieved_context"] = []
-        add_trace(state, "S6.6", "rag_retriever_node", "skipped", "No RAG queries to execute")
+        add_trace(state, "S5.6", "rag_retriever_node", "skipped", "No RAG queries to execute")
         return state
 
     contexts: list[RetrievedContext] = []
@@ -165,7 +201,7 @@ def rag_retriever_node(state: PRReviewState) -> PRReviewState:
     state["retrieved_context"] = contexts[: plan.top_k]
     add_trace(
         state,
-        "S6.6",
+        "S5.6",
         "rag_retriever_node",
         "passed",
         f"Retrieved {len(state['retrieved_context'])} context chunk(s)",
@@ -201,7 +237,7 @@ def context_quality_agent(state: PRReviewState) -> PRReviewState:
 
     state["context_quality"] = result
     status = "passed" if result.context_enough else "failed"
-    add_trace(state, "S6.7", "context_quality_agent", status, result.reason)
+    add_trace(state, "S5.7", "context_quality_agent", status, result.reason)
     return state
 
 
@@ -246,7 +282,7 @@ def pr_review_agent(state: PRReviewState) -> PRReviewState:
     state["findings"] = findings
     add_trace(
         state,
-        "S6.8",
+        "S5.8",
         "pr_review_agent",
         "passed",
         f"Generated {len(findings)} finding(s) for {summary.main_area}",
@@ -254,25 +290,26 @@ def pr_review_agent(state: PRReviewState) -> PRReviewState:
     return state
 
 
-def finding_guardrails_node(state: PRReviewState) -> PRReviewState:
+def finding_guardrail_node(state: PRReviewState) -> PRReviewState:
     findings = state.get("findings", [])
     changed_files = state.get("changed_files", [])
-    state["guardrails"] = GuardrailStatus(
+    state["guardrail_result"] = GuardrailStatus(
         pr_scope_passed=validate_pr_scope(findings, changed_files),
         evidence_passed=validate_evidence(findings),
         hallucination_passed=validate_file_paths(findings, changed_files),
         score_passed=True,
     )
+    state["guardrails"] = state["guardrail_result"]
 
     passed = (
-        state["guardrails"].pr_scope_passed
-        and state["guardrails"].evidence_passed
-        and state["guardrails"].hallucination_passed
+        state["guardrail_result"].pr_scope_passed
+        and state["guardrail_result"].evidence_passed
+        and state["guardrail_result"].hallucination_passed
     )
     add_trace(
         state,
-        "S6.9",
-        "finding_guardrails_node",
+        "S5.9",
+        "finding_guardrail_node",
         "passed" if passed else "failed",
         "Finding guardrails completed",
     )
@@ -280,10 +317,10 @@ def finding_guardrails_node(state: PRReviewState) -> PRReviewState:
 
 
 def eval_judge_agent(state: PRReviewState) -> PRReviewState:
-    state["eval_result"] = run_rule_eval(state.get("findings", []), state["guardrails"])
+    state["eval_result"] = run_rule_eval(state.get("findings", []), state["guardrail_result"])
     add_trace(
         state,
-        "S6.10",
+        "S5.10",
         "eval_judge_agent",
         "passed" if state["eval_result"].passed else "failed",
         f"Eval score {state['eval_result'].score}",
@@ -320,25 +357,45 @@ def final_scoring_agent(state: PRReviewState) -> PRReviewState:
     state["confidence"] = 75 if state.get("retrieved_context") else 65
     state["risk_level"] = risk_level
     state["recommendation"] = recommendation
+    state["score_result"] = {
+        "overall_score": score,
+        "confidence": state["confidence"],
+        "risk_level": risk_level,
+        "recommendation": recommendation,
+    }
 
-    state["guardrails"] = GuardrailStatus(
-        pr_scope_passed=state["guardrails"].pr_scope_passed,
-        evidence_passed=state["guardrails"].evidence_passed,
-        hallucination_passed=state["guardrails"].hallucination_passed,
+    state["guardrail_result"] = GuardrailStatus(
+        pr_scope_passed=state["guardrail_result"].pr_scope_passed,
+        evidence_passed=state["guardrail_result"].evidence_passed,
+        hallucination_passed=state["guardrail_result"].hallucination_passed,
         score_passed=validate_score(score, state["confidence"]),
     )
-    add_trace(state, "S6.11", "final_scoring_agent", "passed", f"Final score {score}")
+    state["guardrails"] = state["guardrail_result"]
+    add_trace(state, "S5.11", "final_scoring_agent", "passed", f"Final score {score}")
     return state
 
 
-def final_response_builder_agent(state: PRReviewState) -> PRReviewState:
+def response_builder_node(state: PRReviewState) -> PRReviewState:
     finding_count = len(state.get("findings", []))
     state["final_summary"] = (
         f"{state['diff_summary'].review_mode} review completed for "
         f"{state['diff_summary'].main_area}. Found {finding_count} finding(s)."
     )
-    add_trace(state, "S6.12", "final_response_builder_agent", "passed", "Final UI response built")
+    state["final_response"] = {
+        "review_mode": "generic",
+        "overall_score": 100,
+        "confidence": 0,
+        "risk_level": "unknown",
+        "recommendation": "workflow_skeleton_only",
+        "summary": "Workflow skeleton executed successfully.",
+        "findings": [],
+    }
+    add_trace(state, "S5.12", "response_builder_node", "passed", "Final skeleton response built")
     return state
+
+
+finding_guardrails_node = finding_guardrail_node
+final_response_builder_agent = response_builder_node
 
 
 def _summarize_file(file_path: str) -> FileChangeSummary:
