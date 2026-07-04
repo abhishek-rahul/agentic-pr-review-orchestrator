@@ -662,6 +662,10 @@ def _diff_prompt(state: PRReviewState) -> str:
     title = metadata.title if metadata else ""
     return (
         "Summarize this GitHub PR as structured DiffSummary. Review only changed files.\n"
+        "Allowed main_change_type values: business_logic_change, test_change, config_change, "
+        "docs_change, dependency_change, mixed_change.\n"
+        "Allowed file change_type values: business_logic, test, model, config, docs, "
+        "dependency, unknown.\n"
         f"PR title: {title}\n"
         f"PR goal: {state.get('pr_goal') or ''}\n"
         f"Changed files: {changed_files}\n"
@@ -672,6 +676,7 @@ def _diff_prompt(state: PRReviewState) -> str:
 def _risk_prompt(state: PRReviewState) -> str:
     return (
         "Classify PR risk as structured RiskSummary. Focus on current PR changes only.\n"
+        "Allowed overall_risk values: low, medium, high, critical.\n"
         f"Diff summary: {state['diff_summary'].model_dump()}\n"
         f"Changed files: {[file.filename for file in state.get('changed_files', [])]}\n"
         f"Diff:\n{_trim_diff(state.get('raw_diff', ''))}"
@@ -684,6 +689,9 @@ def _review_prompt(state: PRReviewState) -> str:
         "Rules: review only current PR diff, do not invent file paths, do not invent line numbers, "
         "docs-only/test-only PRs usually have no findings, business logic without tests can be a finding, "
         "removed validation visible in the diff should be high risk.\n"
+        "Allowed severity values: low, medium, high, critical.\n"
+        "Allowed relation_to_pr values: introduced_by_pr, modified_by_pr, made_worse_by_pr, "
+        "missing_test_for_changed_logic, regression_risk.\n"
         f"PR metadata: {state['pr_metadata'].model_dump()}\n"
         f"Changed files: {[file.model_dump() for file in state.get('changed_files', [])]}\n"
         f"Diff summary: {state['diff_summary'].model_dump()}\n"

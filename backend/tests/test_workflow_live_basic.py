@@ -42,6 +42,15 @@ class FakeStructuredLLM:
         return self.outputs["findings"]
 
 
+class FakeStructuredLLMForFallback:
+    def invoke(self, prompt: str):
+        if "DiffSummary" in prompt:
+            return _diff_summary("business_logic_change", "payment")
+        if "RiskSummary" in prompt or "Classify PR risk" in prompt:
+            return _risk_summary("medium")
+        raise RuntimeError("Force review fallback")
+
+
 def _run_workflow(state: dict) -> dict:
     return asyncio.run(build_review_graph().ainvoke(state))
 
@@ -222,6 +231,93 @@ def test_validation_removal_gets_high_risk(monkeypatch):
 
     assert result["final_response"]["risk_level"] == "high"
     assert result["final_response"]["recommendation"] == "fix_before_merge"
+
+
+def test_business_logic_without_tests_gets_missing_test_finding(monkeypatch):
+    _mock_github(
+        monkeypatch,
+        [
+            ChangedFile(
+                filename="app/payment_service.py",
+                status="modified",
+                additions=2,
+                deletions=0,
+                patch="+ processing_fee = 10\n+ return discounted_amount + processing_fee",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "app.graph.nodes._get_structured_llm",
+        lambda schema: FakeStructuredLLMForFallback(),
+    )
+
+    result = _run_workflow(_initial_state())
+    response = result["final_response"]
+
+    json.dumps(response)
+    assert _trace_pairs(result) == EXPECTED_TRACE
+    assert [(item["step_id"], item["agent_id"]) for item in response["trace"]] == EXPECTED_TRACE
+    assert response["recommendation"] in {"merge_with_caution", "fix_before_merge"}
+    assert any(
+        finding["relation_to_pr"] == "missing_test_for_changed_logic"
+        and finding["severity"] == "medium"
+        and finding["file_path"] == "app/payment_service.py"
+        for finding in response["findings"]
+    )
+    assert any(
+        error["step_id"] == "S6A.8" and error["agent_id"] == "pr_review_agent"
+        for error in response["errors"]
+    )
+
+
+def test_good_test_only_pr_has_no_findings_and_high_score(monkeypatch):
+    file_path = "tests/test_discount_policy.py"
+    _mock_github(
+        monkeypatch,
+        [
+            ChangedFile(
+                filename=file_path,
+                status="modified",
+                additions=1,
+                deletions=0,
+                patch="+ def test_expired_coupon_is_ignored(): pass",
+            )
+        ],
+    )
+    diff = DiffSummary(
+        review_mode="goal_aware",
+        main_change_type="test_change",
+        main_area="tests",
+        goal_detected=True,
+        files=[
+            FileChangeSummary(
+                file_path=file_path,
+                change_type="test",
+                summary="Discount policy tests updated.",
+                risk_hint="low",
+            )
+        ],
+        requires_rag=False,
+        required_review_types=["test_impact"],
+    )
+    risk = RiskSummary(
+        overall_risk="low",
+        risk_reasons=["Only tests changed"],
+        required_review_types=["test_impact"],
+    )
+    _mock_llm(monkeypatch, diff, risk, [])
+
+    result = _run_workflow(_initial_state())
+    response = result["final_response"]
+
+    json.dumps(response)
+    assert _trace_pairs(result) == EXPECTED_TRACE
+    assert [(item["step_id"], item["agent_id"]) for item in response["trace"]] == EXPECTED_TRACE
+    assert response["findings"] == []
+    assert response["risk_level"] == "low"
+    assert response["overall_score"] >= 85
+    assert response["recommendation"] == "merge_ready"
+    assert response["errors"] == []
 
 
 def _run_with_docs_only() -> dict:
