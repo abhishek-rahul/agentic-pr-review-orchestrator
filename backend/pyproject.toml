@@ -1,0 +1,41 @@
+[project]
+name = "agentic-pr-review-backend"
+version = "0.1.0"
+description = "Backend for Agentic PR Review and Code Quality Orchestrator"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "fastapi==0.139.0",
+  "uvicorn[standard]==0.35.0",
+  "pydantic==2.13.4",
+  "httpx==0.28.1",
+  "python-dotenv==1.2.2",
+
+  "langchain==1.3.11",
+  "langchain-core==1.4.8",
+  "langchain-openai==1.3.3",
+  "langgraph==1.2.7",
+  "langgraph-checkpoint==4.1.1",
+  "langchain-elasticsearch==1.0.0",
+
+  "elasticsearch[vectorstore-mmr]==8.19.3",
+
+  "SQLAlchemy==2.0.51",
+  "alembic==1.18.5",
+  "psycopg[binary]==3.2.13"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.4.2",
+  "pytest-asyncio==1.4.0",
+  "respx==0.22.0",
+  "pytest-cov==6.3.0",
+  "ruff==0.13.3"
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

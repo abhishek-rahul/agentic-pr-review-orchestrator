@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: pr_review_postgres
+    environment:
+      POSTGRES_DB: pr_review
+      POSTGRES_USER: pr_user
+      POSTGRES_PASSWORD: pr_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.3
+    container_name: pr_review_elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+
+volumes:
+  postgres_data:
+  elasticsearch_data:
