@@ -535,9 +535,11 @@ def _run_with_docs_only() -> dict:
     original_metadata = nodes.fetch_pr_metadata
     original_files = nodes.fetch_changed_files
     original_structured = nodes._get_structured_llm
+    original_retrieve_context = nodes.rag_retriever.retrieve_context
 
     nodes.fetch_pr_metadata = fake_metadata
     nodes.fetch_changed_files = fake_files
+    nodes.rag_retriever.retrieve_context = lambda *args, **kwargs: []
     nodes._get_structured_llm = lambda schema: FakeStructuredLLM(
         {
             "diff": _diff_summary("docs_change", "documentation"),
@@ -561,3 +563,4 @@ def _run_with_docs_only() -> dict:
         nodes.fetch_pr_metadata = original_metadata
         nodes.fetch_changed_files = original_files
         nodes._get_structured_llm = original_structured
+        nodes.rag_retriever.retrieve_context = original_retrieve_context
