@@ -21,7 +21,8 @@ from app.schemas.risk import RiskSummary
 SOURCE_EXTENSIONS = (".py", ".js", ".ts", ".tsx", ".java", ".go")
 TEST_HINTS = ("test", "spec")
 
-
+# url parse kro 
+# todo github token geenrate kro
 def parse_pr_url_node(state: PRReviewState) -> PRReviewState:
     pr_ref = parse_pr_url(state["pr_url"])
     state["pr_ref"] = pr_ref
@@ -31,7 +32,7 @@ def parse_pr_url_node(state: PRReviewState) -> PRReviewState:
     add_trace(state, _step_id(state, "S5.1", "S6A.1"), "parse_pr_url_node", "passed", "PR URL parsed")
     return state
 
-
+# PR ka detail layega
 async def fetch_pr_data_node(state: PRReviewState) -> PRReviewState:
     pr_ref = state["pr_ref"]
     if _workflow_mode(state) == "skeleton":
