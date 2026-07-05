@@ -40,11 +40,30 @@ def _trace_item_to_dict(item) -> dict:
     return dict(item)
 
 
+def _to_json_safe(value):
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, dict):
+        return {key: _to_json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_json_safe(item) for item in value]
+    return value
+
+
+def _state_for_debug(state: dict) -> dict:
+    debug_state = _to_json_safe(state)
+    raw_diff = debug_state.get("raw_diff")
+    if raw_diff:
+        debug_state["raw_diff"] = f"<hidden: {len(raw_diff)} chars>"
+    return debug_state
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the PR review workflow locally.")
     parser.add_argument("--pr-url", required=True)
     parser.add_argument("--pr-goal", default=None)
     parser.add_argument("--workflow-mode", choices=["skeleton", "live"], default="skeleton")
+    parser.add_argument("--print-state", action="store_true")
     args = parser.parse_args()
 
     result = asyncio.run(_run(args.pr_url, args.pr_goal, args.workflow_mode))
@@ -59,6 +78,11 @@ def main() -> None:
             f"{trace['step_id']} | {trace['agent_id']} | "
             f"{trace['status']} | {trace['summary']}"
         )
+
+    if args.print_state:
+        print()
+        print("final_state:")
+        print(json.dumps(_state_for_debug(result), indent=2))
 
 
 if __name__ == "__main__":
