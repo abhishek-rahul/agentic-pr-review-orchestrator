@@ -29,6 +29,7 @@ class PRReviewState(TypedDict, total=False):
     diff_summary: DiffSummary
     risk_summary: RiskSummary
     rag_query_plan: RAGQueryPlan
+    previous_rag_queries: list[str]
     retrieved_context: list[RetrievedContext]
     context_quality: ContextQualityResult
 

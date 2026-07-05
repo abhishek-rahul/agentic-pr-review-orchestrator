@@ -10,6 +10,7 @@ from app.guardrails.evidence import validate_evidence
 from app.guardrails.hallucination import validate_file_paths
 from app.guardrails.pr_scope import validate_pr_scope
 from app.guardrails.scoring import validate_score
+from app.rag import retriever as rag_retriever
 from app.rag.retriever import retrieve_context_placeholder
 from app.schemas.diff import DiffSummary, FileChangeSummary
 from app.schemas.eval import GuardrailStatus
@@ -129,8 +130,28 @@ def risk_classification_agent(state: PRReviewState) -> PRReviewState:
 
 def rag_query_planner_agent(state: PRReviewState) -> PRReviewState:
     if _workflow_mode(state) == "live":
-        state["rag_query_plan"] = RAGQueryPlan(queries=[], top_k=0)
-        add_trace(state, "S6A.5", "rag_query_planner_agent", "skipped", "RAG planning skipped in Step 6A")
+        try:
+            plan = _get_structured_llm(RAGQueryPlan).invoke(_rag_query_prompt(state))
+        except Exception as exc:
+            _append_error(state, "S6A.5", "rag_query_planner_agent", str(exc))
+            plan = _fallback_rag_query_plan(state)
+
+        state["rag_query_plan"] = _clean_rag_query_plan(plan, state)
+        previous_queries = state.setdefault("previous_rag_queries", [])
+        for item in state["rag_query_plan"].queries:
+            if item.query not in previous_queries:
+                previous_queries.append(item.query)
+        print(
+            "[rag_query_planner_agent] "
+            f"queries={len(state['rag_query_plan'].queries)} top_k={state['rag_query_plan'].top_k}"
+        )
+        add_trace(
+            state,
+            "S6A.5",
+            "rag_query_planner_agent",
+            "passed",
+            f"Planned {len(state['rag_query_plan'].queries)} RAG query(ies)",
+        )
         return state
 
     summary = state["diff_summary"]
@@ -170,8 +191,39 @@ def rag_query_planner_agent(state: PRReviewState) -> PRReviewState:
 
 def rag_retriever_node(state: PRReviewState) -> PRReviewState:
     if _workflow_mode(state) == "live":
-        state["retrieved_context"] = []
-        add_trace(state, "S6A.6", "rag_retriever_node", "skipped", "RAG retrieval skipped in Step 6A")
+        plan = state.get("rag_query_plan")
+        if not plan or not plan.queries:
+            state["retrieved_context"] = []
+            add_trace(state, "S6A.6", "rag_retriever_node", "skipped", "No RAG queries to execute")
+            return state
+
+        contexts: list[RetrievedContext] = []
+        try:
+            for item in plan.queries:
+                contexts.extend(
+                    rag_retriever.retrieve_context(
+                        item.query,
+                        repo_name=state["repo"],
+                        branch=state["pr_metadata"].base_branch,
+                        top_k=plan.top_k,
+                    )
+                )
+        except Exception as exc:
+            _append_error(state, "S6A.6", "rag_retriever_node", str(exc))
+            contexts = []
+
+        state["retrieved_context"] = _dedupe_and_filter_contexts(contexts)[:10]
+        print(
+            "[rag_retriever_node] "
+            f"queries={len(plan.queries)} chunks_found={len(state['retrieved_context'])}"
+        )
+        add_trace(
+            state,
+            "S6A.6",
+            "rag_retriever_node",
+            "passed",
+            f"Retrieved {len(state['retrieved_context'])} context chunk(s)",
+        )
         return state
 
     plan = state.get("rag_query_plan")
@@ -205,13 +257,27 @@ def rag_retriever_node(state: PRReviewState) -> PRReviewState:
 
 def context_quality_agent(state: PRReviewState) -> PRReviewState:
     if _workflow_mode(state) == "live":
-        state["context_quality"] = ContextQualityResult(
-            context_enough=True,
-            reason="RAG context quality check skipped in Step 6A.",
-            missing_context=[],
-            suggested_queries=[],
+        basic_result = _basic_context_check(state)
+        try:
+            state["context_quality"] = _get_structured_llm(ContextQualityResult).invoke(
+                _context_quality_prompt(state, basic_result)
+            )
+        except Exception as exc:
+            _append_error(state, "S6A.7", "context_quality_agent", str(exc))
+            state["context_quality"] = basic_result
+
+        print(
+            "[context_quality_agent] "
+            f"enough={state['context_quality'].context_enough} "
+            f"retry_count={state.get('retry_count', {}).get('context_quality', 0)}"
         )
-        add_trace(state, "S6A.7", "context_quality_agent", "skipped", state["context_quality"].reason)
+        add_trace(
+            state,
+            "S6A.7",
+            "context_quality_agent",
+            "passed" if state["context_quality"].context_enough else "failed",
+            state["context_quality"].reason,
+        )
         return state
 
     summary = state["diff_summary"]
@@ -618,6 +684,133 @@ def _deterministic_risk_summary(state: PRReviewState) -> RiskSummary:
     )
 
 
+def _fallback_rag_query_plan(state: PRReviewState) -> RAGQueryPlan:
+    summary = state["diff_summary"]
+    risk = state["risk_summary"]
+    changed_paths = " ".join(file.filename for file in state.get("changed_files", []))
+    query_texts = [
+        f"{summary.main_area} related source code {changed_paths}".strip(),
+        f"{summary.main_area} related tests validation edge cases".strip(),
+    ]
+    if state.get("pr_goal"):
+        query_texts.append(str(state["pr_goal"]))
+    for reason in risk.risk_reasons[:2]:
+        query_texts.append(f"{summary.main_area} {reason}")
+
+    return RAGQueryPlan(
+        queries=[
+            RAGQuery(query=query, purpose="Find PR-related repository context")
+            for query in query_texts
+            if query.strip()
+        ],
+        top_k=6,
+    )
+
+
+def _clean_rag_query_plan(plan: RAGQueryPlan, state: PRReviewState) -> RAGQueryPlan:
+    previous = set(state.get("previous_rag_queries", []))
+    cleaned: list[RAGQuery] = []
+    for item in plan.queries:
+        query = item.query.strip()
+        if not query or query in previous or _is_generic_query(query):
+            continue
+        cleaned.append(RAGQuery(query=query, purpose=item.purpose.strip() or "Find PR-related context"))
+        if len(cleaned) == 5:
+            break
+
+    if not cleaned:
+        return _fallback_rag_query_plan(state)
+
+    top_k = plan.top_k or 6
+    return RAGQueryPlan(queries=cleaned, top_k=max(1, min(top_k, 10)))
+
+
+def _is_generic_query(query: str) -> bool:
+    lower = query.lower().strip()
+    generic_phrases = {
+        "best practices",
+        "clean code",
+        "security tips",
+        "general review",
+        "how to write good tests",
+    }
+    return lower in generic_phrases or any(phrase == lower for phrase in generic_phrases)
+
+
+def _dedupe_and_filter_contexts(contexts: list[RetrievedContext]) -> list[RetrievedContext]:
+    seen: set[str] = set()
+    filtered: list[RetrievedContext] = []
+    for context in contexts:
+        if _is_unsafe_context_path(context.file_path):
+            continue
+        key = f"{context.file_path}:{context.content[:120]}"
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(context)
+    return filtered
+
+
+def _is_unsafe_context_path(file_path: str) -> bool:
+    lower = file_path.lower().replace("\\", "/")
+    blocked_parts = [
+        ".env",
+        ".git/",
+        ".venv/",
+        "node_modules/",
+        "dist/",
+        "build/",
+        "__pycache__/",
+    ]
+    return (
+        any(part in lower for part in blocked_parts)
+        or lower.endswith((".log", ".pyc", ".class", ".jar", ".png", ".jpg", ".jpeg", ".gif"))
+    )
+
+
+def _basic_context_check(state: PRReviewState) -> ContextQualityResult:
+    summary = state["diff_summary"]
+    risk = state["risk_summary"]
+    contexts = state.get("retrieved_context", [])
+
+    if summary.main_change_type in {"docs_change", "test_change"}:
+        return ContextQualityResult(
+            context_enough=True,
+            reason="Weak or empty context is acceptable for docs/test-only PR.",
+            missing_context=[],
+            suggested_queries=[],
+        )
+
+    if contexts:
+        return ContextQualityResult(
+            context_enough=True,
+            reason="Retrieved repository context is available for the PR review.",
+            missing_context=[],
+            suggested_queries=[],
+        )
+
+    if summary.main_change_type == "business_logic_change":
+        suggested = [
+            f"{summary.main_area} related source code",
+            f"{summary.main_area} related tests",
+        ]
+        if risk.overall_risk in {"high", "critical"}:
+            suggested.append(f"{summary.main_area} validation rules")
+        return ContextQualityResult(
+            context_enough=False,
+            reason="No context retrieved for business logic PR.",
+            missing_context=["related source code", "related tests"],
+            suggested_queries=suggested,
+        )
+
+    return ContextQualityResult(
+        context_enough=True,
+        reason="Context is acceptable for this basic Step 6B review.",
+        missing_context=[],
+        suggested_queries=[],
+    )
+
+
 def _fallback_findings(state: PRReviewState) -> list[Finding]:
     files = state.get("changed_files", [])
     raw_diff = state.get("raw_diff", "").lower()
@@ -674,6 +867,22 @@ def _diff_prompt(state: PRReviewState) -> str:
     )
 
 
+def _rag_query_prompt(state: PRReviewState) -> str:
+    context_quality = state.get("context_quality")
+    return (
+        "Create a focused RAGQueryPlan for finding repository context relevant to this PR only.\n"
+        "Generate 2 to 5 concrete queries. Avoid generic queries such as best practices, "
+        "clean code, security tips, general review, or how to write good tests.\n"
+        f"PR goal: {state.get('pr_goal') or ''}\n"
+        f"Changed files: {[file.filename for file in state.get('changed_files', [])]}\n"
+        f"Diff summary: {state['diff_summary'].model_dump()}\n"
+        f"Risk summary: {state['risk_summary'].model_dump()}\n"
+        f"Previous RAG queries: {state.get('previous_rag_queries', [])}\n"
+        f"Missing context: {context_quality.missing_context if context_quality else []}\n"
+        f"Suggested queries: {context_quality.suggested_queries if context_quality else []}"
+    )
+
+
 def _risk_prompt(state: PRReviewState) -> str:
     return (
         "Classify PR risk as structured RiskSummary. Focus on current PR changes only.\n"
@@ -690,6 +899,8 @@ def _review_prompt(state: PRReviewState) -> str:
         "Rules: review only current PR diff, do not invent file paths, do not invent line numbers, "
         "docs-only/test-only PRs usually have no findings, business logic without tests can be a finding, "
         "removed validation visible in the diff should be high risk.\n"
+        "Retrieved repo context is provided only to understand the current PR. Do not report issues "
+        "from context files unless the current PR introduced, modified, or made worse the issue.\n"
         "Allowed severity values: low, medium, high, critical.\n"
         "Allowed relation_to_pr values: introduced_by_pr, modified_by_pr, made_worse_by_pr, "
         "missing_test_for_changed_logic, regression_risk.\n"
@@ -697,9 +908,36 @@ def _review_prompt(state: PRReviewState) -> str:
         f"Changed files: {[file.model_dump() for file in state.get('changed_files', [])]}\n"
         f"Diff summary: {state['diff_summary'].model_dump()}\n"
         f"Risk summary: {state['risk_summary'].model_dump()}\n"
+        f"Context quality: {state.get('context_quality').model_dump() if state.get('context_quality') else {}}\n"
+        f"Retrieved context: {[_context_for_prompt(item) for item in state.get('retrieved_context', [])]}\n"
         f"PR goal: {state.get('pr_goal') or ''}\n"
         f"Diff:\n{_trim_diff(state.get('raw_diff', ''))}"
     )
+
+
+def _context_quality_prompt(state: PRReviewState, basic_result: ContextQualityResult) -> str:
+    return (
+        "Decide whether retrieved repository context is enough for this PR review as "
+        "structured ContextQualityResult.\n"
+        "Docs-only and test-only PRs can pass with weak context. Business logic, payment, auth, "
+        "security, high-risk, or critical PRs should prefer related source and test context.\n"
+        f"Basic check result: {basic_result.model_dump()}\n"
+        f"PR goal: {state.get('pr_goal') or ''}\n"
+        f"Changed files: {[file.filename for file in state.get('changed_files', [])]}\n"
+        f"Diff summary: {state['diff_summary'].model_dump()}\n"
+        f"Risk summary: {state['risk_summary'].model_dump()}\n"
+        f"RAG query plan: {state.get('rag_query_plan').model_dump() if state.get('rag_query_plan') else {}}\n"
+        f"Retrieved context: {[_context_for_prompt(item) for item in state.get('retrieved_context', [])]}"
+    )
+
+
+def _context_for_prompt(context: RetrievedContext) -> dict:
+    return {
+        "file_path": context.file_path,
+        "reason": context.reason,
+        "score": context.score,
+        "content_preview": context.content[:600],
+    }
 
 
 def _build_live_summary(state: PRReviewState) -> str:

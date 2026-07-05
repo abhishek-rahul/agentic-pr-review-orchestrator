@@ -2,7 +2,10 @@ import asyncio
 import json
 
 from app.graph.workflow import build_review_graph
+from app.graph.nodes import context_quality_agent, rag_query_planner_agent, rag_retriever_node
+from app.graph.routers import route_after_context_quality
 from app.schemas.diff import DiffSummary, FileChangeSummary
+from app.schemas.rag import ContextQualityResult, RAGQuery, RAGQueryPlan, RetrievedContext
 from app.schemas.finding import Finding, FindingList
 from app.schemas.pr import ChangedFile, PRMetadata
 from app.schemas.risk import RiskSummary
@@ -39,6 +42,10 @@ class FakeStructuredLLM:
             return self.outputs["diff"]
         if "RiskSummary" in prompt or "Classify PR risk" in prompt:
             return self.outputs["risk"]
+        if "RAGQueryPlan" in prompt:
+            return self.outputs["rag_query_plan"]
+        if "ContextQualityResult" in prompt:
+            return self.outputs["context_quality"]
         return self.outputs["findings"]
 
 
@@ -48,6 +55,18 @@ class FakeStructuredLLMForFallback:
             return _diff_summary("business_logic_change", "payment")
         if "RiskSummary" in prompt or "Classify PR risk" in prompt:
             return _risk_summary("medium")
+        if "RAGQueryPlan" in prompt:
+            return RAGQueryPlan(
+                queries=[RAGQuery(query="payment service source code", purpose="Find related source code")],
+                top_k=6,
+            )
+        if "ContextQualityResult" in prompt:
+            return ContextQualityResult(
+                context_enough=True,
+                reason="Mock context is enough.",
+                missing_context=[],
+                suggested_queries=[],
+            )
         raise RuntimeError("Force review fallback")
 
 
@@ -91,12 +110,26 @@ def _mock_github(monkeypatch, files: list[ChangedFile]) -> None:
 
     monkeypatch.setattr("app.graph.nodes.fetch_pr_metadata", fake_metadata)
     monkeypatch.setattr("app.graph.nodes.fetch_changed_files", fake_files)
+    monkeypatch.setattr("app.rag.retriever.retrieve_context", lambda *args, **kwargs: [])
 
 
 def _mock_llm(monkeypatch, diff: DiffSummary, risk: RiskSummary, findings: list[Finding]) -> None:
     outputs = {
         "diff": diff,
         "risk": risk,
+        "rag_query_plan": RAGQueryPlan(
+            queries=[
+                RAGQuery(query="payment service source code", purpose="Find related source code"),
+                RAGQuery(query="payment service tests", purpose="Find related tests"),
+            ],
+            top_k=6,
+        ),
+        "context_quality": ContextQualityResult(
+            context_enough=True,
+            reason="Mock context is enough.",
+            missing_context=[],
+            suggested_queries=[],
+        ),
         "findings": FindingList(findings=findings),
     }
     monkeypatch.setattr("app.graph.nodes._get_structured_llm", lambda schema: FakeStructuredLLM(outputs))
@@ -142,6 +175,28 @@ def _high_finding() -> Finding:
     )
 
 
+def _rag_state() -> dict:
+    state = _initial_state()
+    state["repo"] = "sample-payment-service"
+    state["pr_metadata"] = PRMetadata(
+        title="Mock PR",
+        author="octocat",
+        base_branch="main",
+        head_branch="feature",
+        state="open",
+        additions=5,
+        deletions=2,
+        changed_files_count=1,
+    )
+    state["changed_files"] = [
+        ChangedFile(filename="app/payment_service.py", status="modified", patch="+ payment change")
+    ]
+    state["raw_diff"] = "+ payment change"
+    state["diff_summary"] = _diff_summary()
+    state["risk_summary"] = _risk_summary("medium")
+    return state
+
+
 def test_live_workflow_uses_mocked_github_and_llm(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     _mock_github(
@@ -157,7 +212,7 @@ def test_live_workflow_uses_mocked_github_and_llm(monkeypatch):
         ],
     )
     _mock_llm(monkeypatch, _diff_summary(), _risk_summary(), [_high_finding()])
-    monkeypatch.setattr("app.rag.retriever.retrieve_context", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr("app.rag.retriever.retrieve_context", lambda *args, **kwargs: [])
 
     result = _run_workflow(_initial_state())
 
@@ -320,6 +375,145 @@ def test_good_test_only_pr_has_no_findings_and_high_score(monkeypatch):
     assert response["errors"] == []
 
 
+def test_rag_query_planner_returns_structured_plan(monkeypatch):
+    state = _rag_state()
+    _mock_llm(monkeypatch, _diff_summary(), _risk_summary("medium"), [])
+
+    result = rag_query_planner_agent(state)
+
+    assert result["rag_query_plan"].queries
+    assert result["previous_rag_queries"]
+
+
+def test_rag_query_planner_fallback_filters_generic_queries(monkeypatch):
+    class FailingPlanner:
+        def invoke(self, prompt: str):
+            raise RuntimeError("planner failed")
+
+    state = _rag_state()
+    monkeypatch.setattr("app.graph.nodes._get_structured_llm", lambda schema: FailingPlanner())
+
+    result = rag_query_planner_agent(state)
+
+    assert result["rag_query_plan"].queries
+    assert all(query.query != "best practices" for query in result["rag_query_plan"].queries)
+
+
+def test_rag_retriever_uses_mocked_retrieve_context_and_dedupes(monkeypatch):
+    state = _rag_state()
+    state["rag_query_plan"] = RAGQueryPlan(
+        queries=[RAGQuery(query="payment service", purpose="Find payment code")],
+        top_k=6,
+    )
+    context = RetrievedContext(
+        file_path="app/payment_service.py",
+        content="def apply_coupon(): pass",
+        reason="matched",
+        score=1.0,
+    )
+    monkeypatch.setattr("app.rag.retriever.retrieve_context", lambda *args, **kwargs: [context, context])
+
+    result = rag_retriever_node(state)
+
+    assert len(result["retrieved_context"]) == 1
+    assert result["retrieved_context"][0].file_path == "app/payment_service.py"
+
+
+def test_rag_retriever_handles_failure_gracefully(monkeypatch):
+    state = _rag_state()
+    state["rag_query_plan"] = RAGQueryPlan(
+        queries=[RAGQuery(query="payment service", purpose="Find payment code")],
+        top_k=6,
+    )
+
+    def fail_retriever(*args, **kwargs):
+        raise RuntimeError("Elasticsearch unavailable")
+
+    monkeypatch.setattr("app.rag.retriever.retrieve_context", fail_retriever)
+
+    result = rag_retriever_node(state)
+
+    assert result["retrieved_context"] == []
+    assert any(error["step_id"] == "S6A.6" for error in result["errors"])
+
+
+def test_context_quality_passes_for_test_only_empty_context(monkeypatch):
+    class FailingContextQuality:
+        def invoke(self, prompt: str):
+            raise RuntimeError("context quality failed")
+
+    state = _rag_state()
+    state["diff_summary"] = _diff_summary("test_change", "tests")
+    state["risk_summary"] = _risk_summary("low")
+    state["retrieved_context"] = []
+    monkeypatch.setattr("app.graph.nodes._get_structured_llm", lambda schema: FailingContextQuality())
+
+    result = context_quality_agent(state)
+
+    assert result["context_quality"].context_enough
+
+
+def test_context_quality_fails_for_business_logic_empty_context(monkeypatch):
+    class FailingContextQuality:
+        def invoke(self, prompt: str):
+            raise RuntimeError("context quality failed")
+
+    state = _rag_state()
+    state["retrieved_context"] = []
+    monkeypatch.setattr("app.graph.nodes._get_structured_llm", lambda schema: FailingContextQuality())
+
+    result = context_quality_agent(state)
+
+    assert not result["context_quality"].context_enough
+    assert result["context_quality"].suggested_queries
+
+
+def test_context_quality_falls_back_to_basic_check_when_llm_fails(monkeypatch):
+    class FailingContextQuality:
+        def invoke(self, prompt: str):
+            raise RuntimeError("context quality failed")
+
+    state = _rag_state()
+    state["retrieved_context"] = []
+    monkeypatch.setattr("app.graph.nodes._get_structured_llm", lambda schema: FailingContextQuality())
+
+    result = context_quality_agent(state)
+
+    assert not result["context_quality"].context_enough
+    assert any(error["step_id"] == "S6A.7" for error in result["errors"])
+
+
+def test_context_router_retries_and_increments_only_in_router():
+    state = _rag_state()
+    state["context_quality"] = ContextQualityResult(
+        context_enough=False,
+        reason="Need more context",
+        missing_context=["related source code"],
+        suggested_queries=["payment service source"],
+    )
+
+    route = route_after_context_quality(state)
+
+    assert route == "rag_query_planner"
+    assert state["retry_count"]["context_quality"] == 1
+
+
+def test_context_router_proceeds_after_max_retry():
+    state = _rag_state()
+    state["retry_count"]["context_quality"] = 3
+    state["context_quality"] = ContextQualityResult(
+        context_enough=False,
+        reason="Need more context",
+        missing_context=["related source code"],
+        suggested_queries=["payment service source"],
+    )
+
+    route = route_after_context_quality(state)
+
+    assert route == "pr_review"
+    assert state["retry_count"]["context_quality"] == 3
+
+
 def _run_with_docs_only() -> dict:
     from app.graph import nodes
 
@@ -348,6 +542,16 @@ def _run_with_docs_only() -> dict:
         {
             "diff": _diff_summary("docs_change", "documentation"),
             "risk": _risk_summary("low"),
+            "rag_query_plan": RAGQueryPlan(
+                queries=[RAGQuery(query="documentation changes", purpose="Find related docs")],
+                top_k=6,
+            ),
+            "context_quality": ContextQualityResult(
+                context_enough=True,
+                reason="Mock docs context is enough.",
+                missing_context=[],
+                suggested_queries=[],
+            ),
             "findings": FindingList(findings=[]),
         }
     )

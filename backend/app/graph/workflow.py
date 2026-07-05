@@ -1,5 +1,6 @@
 from langgraph.graph import END, START, StateGraph
 
+from app.graph.routers import route_after_context_quality
 from app.graph.nodes import (
     context_quality_agent,
     diff_understanding_agent,
@@ -40,7 +41,14 @@ def build_review_graph():
     graph.add_edge("risk_classification", "rag_query_planner")
     graph.add_edge("rag_query_planner", "rag_retriever")
     graph.add_edge("rag_retriever", "context_quality")
-    graph.add_edge("context_quality", "pr_review")
+    graph.add_conditional_edges(
+        "context_quality",
+        route_after_context_quality,
+        {
+            "rag_query_planner": "rag_query_planner",
+            "pr_review": "pr_review",
+        },
+    )
     graph.add_edge("pr_review", "finding_guardrail")
     graph.add_edge("finding_guardrail", "eval_judge")
     graph.add_edge("eval_judge", "final_scoring")
