@@ -1,7 +1,13 @@
 from typing import Any, Literal, TypedDict
 
 from app.schemas.diff import DiffSummary
-from app.schemas.eval import EvalResult, GuardrailStatus
+from app.schemas.eval import (
+    EvalResult,
+    FindingGuardrailResult,
+    GuardrailStatus,
+    ScoreBreakdown,
+    ScoreGuardrailResult,
+)
 from app.schemas.finding import Finding
 from app.schemas.pr import ChangedFile, PRMetadata, PRRef
 from app.schemas.rag import ContextQualityResult, RAGQueryPlan, RetrievedContext
@@ -37,8 +43,14 @@ class PRReviewState(TypedDict, total=False):
     findings: list[Finding]
     guardrail_result: GuardrailStatus
     guardrails: GuardrailStatus
+    finding_guardrail_result: FindingGuardrailResult
+    review_retry_instruction: str | None
     eval_result: EvalResult
+    eval_improvement_instruction: str | None
     score_result: dict[str, Any]
+    score_breakdown: ScoreBreakdown
+    score_guardrail_result: ScoreGuardrailResult
+    scoring_retry_instruction: str | None
     final_response: dict[str, Any]
 
     # final scoring agent

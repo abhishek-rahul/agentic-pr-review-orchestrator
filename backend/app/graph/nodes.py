@@ -13,7 +13,14 @@ from app.guardrails.scoring import validate_score
 from app.rag import retriever as rag_retriever
 from app.rag.retriever import retrieve_context_placeholder
 from app.schemas.diff import DiffSummary, FileChangeSummary
-from app.schemas.eval import GuardrailStatus
+from app.schemas.eval import (
+    EvalResult,
+    FindingGuardrailResult,
+    GuardrailIssue,
+    GuardrailStatus,
+    ScoreBreakdown,
+    ScoreGuardrailResult,
+)
 from app.schemas.finding import Finding, FindingList
 from app.schemas.pr import ChangedFile, PRMetadata
 from app.schemas.rag import ContextQualityResult, RAGQuery, RAGQueryPlan, RetrievedContext
@@ -381,6 +388,7 @@ def pr_review_agent(state: PRReviewState) -> PRReviewState:
 def finding_guardrail_node(state: PRReviewState) -> PRReviewState:
     findings = state.get("findings", [])
     changed_files = state.get("changed_files", [])
+    finding_guardrail_result = _run_finding_guardrails(state)
     state["guardrail_result"] = GuardrailStatus(
         pr_scope_passed=validate_pr_scope(findings, changed_files),
         evidence_passed=validate_evidence(findings),
@@ -388,11 +396,17 @@ def finding_guardrail_node(state: PRReviewState) -> PRReviewState:
         score_passed=True,
     )
     state["guardrails"] = state["guardrail_result"]
+    state["finding_guardrail_result"] = finding_guardrail_result
 
     passed = (
         state["guardrail_result"].pr_scope_passed
         and state["guardrail_result"].evidence_passed
         and state["guardrail_result"].hallucination_passed
+        and finding_guardrail_result.passed
+    )
+    print(
+        "[finding_guardrail_node] "
+        f"passed={finding_guardrail_result.passed} issues={len(finding_guardrail_result.issues)}"
     )
     add_trace(
         state,
@@ -405,7 +419,19 @@ def finding_guardrail_node(state: PRReviewState) -> PRReviewState:
 
 
 def eval_judge_agent(state: PRReviewState) -> PRReviewState:
-    state["eval_result"] = run_rule_eval(state.get("findings", []), state["guardrail_result"])
+    if _workflow_mode(state) == "live":
+        try:
+            state["eval_result"] = _get_structured_llm(EvalResult).invoke(_eval_prompt(state))
+        except Exception as exc:
+            _append_error(state, "S6A.10", "eval_judge_agent", str(exc))
+            state["eval_result"] = run_rule_eval(state.get("findings", []), state["guardrail_result"])
+    else:
+        state["eval_result"] = run_rule_eval(state.get("findings", []), state["guardrail_result"])
+
+    print(
+        "[eval_judge_agent] "
+        f"passed={state['eval_result'].passed} score={state['eval_result'].score}"
+    )
     add_trace(
         state,
         _step_id(state, "S5.10", "S6A.10"),
@@ -419,16 +445,25 @@ def eval_judge_agent(state: PRReviewState) -> PRReviewState:
 def final_scoring_agent(state: PRReviewState) -> PRReviewState:
     findings = state.get("findings", [])
     if _workflow_mode(state) == "live":
-        base_by_risk = {"low": 95, "medium": 82, "high": 65, "critical": 50}
-        penalties = {"low": 5, "medium": 12, "high": 25, "critical": 35}
-        score = base_by_risk.get(state["risk_summary"].overall_risk, 60)
+        score = 100
+        penalties = {"low": 3, "medium": 8, "high": 18, "critical": 30}
         score -= sum(penalties[finding.severity] for finding in findings)
-        if not (
-            state["guardrail_result"].pr_scope_passed
-            and state["guardrail_result"].evidence_passed
-            and state["guardrail_result"].hallucination_passed
+
+        high_risk_area = _is_high_risk_area(state)
+        if high_risk_area and findings:
+            score -= 5
+        if state.get("context_quality") and not state["context_quality"].context_enough:
+            score -= 8
+        if not state["eval_result"].passed or state["eval_result"].score < 70:
+            score -= 10
+        if (
+            state.get("finding_guardrail_result")
+            and not state["finding_guardrail_result"].passed
+            and state.get("retry_count", {}).get("finding_guardrail", 0) >= 3
         ):
-            score = min(score, 60)
+            score -= 10
+        if high_risk_area and any(finding.relation_to_pr == "missing_test_for_changed_logic" for finding in findings):
+            score -= 5
     else:
         penalties = {"low": 3, "medium": 8, "high": 18, "critical": 30}
         score = 100 - sum(penalties[finding.severity] for finding in findings)
@@ -440,17 +475,33 @@ def final_scoring_agent(state: PRReviewState) -> PRReviewState:
     score = max(0, min(100, score))
 
     if _workflow_mode(state) == "live":
-        if score >= 85 and not any(finding.severity in {"high", "critical"} for finding in findings):
-            risk_level = state["risk_summary"].overall_risk
+        if any(finding.severity == "critical" for finding in findings):
+            risk_level = "critical"
+            recommendation = "needs_human_review"
+        elif any(finding.severity == "high" for finding in findings) or state["risk_summary"].overall_risk in {"high", "critical"}:
+            risk_level = "high"
+            recommendation = "fix_before_merge" if score >= 50 else "needs_human_review"
+        elif any(finding.severity == "medium" for finding in findings):
+            risk_level = "medium"
+            if score >= 85:
+                recommendation = "merge_ready"
+            elif score >= 70:
+                recommendation = "merge_with_caution"
+            elif score >= 50:
+                recommendation = "fix_before_merge"
+            else:
+                recommendation = "needs_human_review"
+        elif score >= 85:
+            risk_level = "low"
             recommendation = "merge_ready"
         elif score >= 70:
-            risk_level = state["risk_summary"].overall_risk
+            risk_level = "low"
             recommendation = "merge_with_caution"
-        elif score >= 40:
-            risk_level = state["risk_summary"].overall_risk
+        elif score >= 50:
+            risk_level = "medium"
             recommendation = "fix_before_merge"
         else:
-            risk_level = state["risk_summary"].overall_risk
+            risk_level = "high"
             recommendation = "needs_human_review"
     elif score >= 90:
         risk_level = "low"
@@ -466,11 +517,13 @@ def final_scoring_agent(state: PRReviewState) -> PRReviewState:
         recommendation = "do_not_merge"
 
     state["overall_score"] = score
-    state["confidence"] = 75 if _workflow_mode(state) == "live" and not state.get("errors") else 60
+    state["confidence"] = _calculate_confidence(state, score) if _workflow_mode(state) == "live" else 60
     if _workflow_mode(state) == "skeleton":
         state["confidence"] = 75 if state.get("retrieved_context") else 65
     state["risk_level"] = risk_level
     state["recommendation"] = recommendation
+    if _workflow_mode(state) == "live":
+        state["score_breakdown"] = _build_score_breakdown(state, score)
     state["score_result"] = {
         "overall_score": score,
         "confidence": state["confidence"],
@@ -485,7 +538,36 @@ def final_scoring_agent(state: PRReviewState) -> PRReviewState:
         score_passed=validate_score(score, state["confidence"]),
     )
     state["guardrails"] = state["guardrail_result"]
+    print(
+        "[final_scoring_agent] "
+        f"score={score} confidence={state['confidence']} risk={risk_level}"
+    )
     add_trace(state, _step_id(state, "S5.11", "S6A.11"), "final_scoring_agent", "passed", f"Final score {score}")
+    return state
+
+
+def score_guardrail_node(state: PRReviewState) -> PRReviewState:
+    if _workflow_mode(state) != "live":
+        state["score_guardrail_result"] = ScoreGuardrailResult(passed=True)
+        return state
+
+    result = _run_score_guardrails(state)
+    state["score_guardrail_result"] = result
+    state["guardrail_result"] = GuardrailStatus(
+        pr_scope_passed=state["guardrail_result"].pr_scope_passed,
+        evidence_passed=state["guardrail_result"].evidence_passed,
+        hallucination_passed=state["guardrail_result"].hallucination_passed,
+        score_passed=result.passed,
+    )
+    state["guardrails"] = state["guardrail_result"]
+    print(f"[score_guardrail_node] passed={result.passed} issues={len(result.issues)}")
+    add_trace(
+        state,
+        "S6D.1",
+        "score_guardrail_node",
+        "passed" if result.passed else "failed",
+        "Score guardrails completed",
+    )
     return state
 
 
@@ -505,7 +587,14 @@ def response_builder_node(state: PRReviewState) -> PRReviewState:
             "findings": [_finding_to_response(finding) for finding in state.get("findings", [])],
             "trace": [_model_dump(item) for item in state.get("trace", [])],
             "errors": state.get("errors", []),
+            "context_quality": _optional_model_dump(state.get("context_quality")),
+            "finding_guardrail_result": _optional_model_dump(state.get("finding_guardrail_result")),
+            "eval_result": _optional_model_dump(state.get("eval_result")),
+            "score_guardrail_result": _optional_model_dump(state.get("score_guardrail_result")),
+            "score_breakdown": _optional_model_dump(state.get("score_breakdown")),
+            "retry_count": state.get("retry_count", {}),
         }
+        print("[response_builder_node] final_response_ready=true")
         return state
 
     finding_count = len(state.get("findings", []))
@@ -619,6 +708,18 @@ def _model_dump(value) -> dict:
     if hasattr(value, "model_dump"):
         return value.model_dump()
     return dict(value)
+
+
+def _optional_model_dump(value) -> dict | None:
+    if value is None:
+        return None
+    return _model_dump(value)
+
+
+def _finding_value(finding, field: str, default=None):
+    if isinstance(finding, dict):
+        return finding.get(field, default)
+    return getattr(finding, field, default)
 
 
 def _deterministic_diff_summary(state: PRReviewState) -> DiffSummary:
@@ -811,6 +912,164 @@ def _basic_context_check(state: PRReviewState) -> ContextQualityResult:
     )
 
 
+def _run_finding_guardrails(state: PRReviewState) -> FindingGuardrailResult:
+    findings = state.get("findings", [])
+    changed_paths = {file.filename for file in state.get("changed_files", [])}
+    context_paths = {context.file_path for context in state.get("retrieved_context", [])}
+    allowed_paths = changed_paths | context_paths
+    issues: list[GuardrailIssue] = []
+    rejected: set[int] = set()
+
+    for index, finding in enumerate(findings):
+        file_path = _finding_value(finding, "file_path", "")
+        issue = _finding_value(finding, "issue", "")
+        suggestion = _finding_value(finding, "suggestion", "")
+        evidence = _finding_value(finding, "evidence", "")
+        relevance = _finding_value(finding, "pr_relevance_reason", "") or _finding_value(finding, "relation_to_pr", "")
+        severity = _finding_value(finding, "severity", "")
+        line_number = _finding_value(finding, "line_number")
+
+        def reject(name: str, reason: str) -> None:
+            issues.append(GuardrailIssue(guardrail_name=name, reason=reason, finding_index=index))
+            rejected.add(index)
+
+        if file_path not in allowed_paths:
+            reject("pr_scope", f"Finding path is not in changed files or retrieved context: {file_path}")
+        if not all(str(value).strip() for value in [file_path, issue, suggestion, evidence, relevance]):
+            reject("evidence", "Finding is missing required evidence, issue, suggestion, path, or PR relevance.")
+        if line_number is not None and line_number < 0:
+            reject("hallucination", "Finding line_number cannot be negative.")
+        if severity not in {"low", "medium", "high", "critical"}:
+            reject("severity", f"Invalid severity: {severity}")
+        elif _severity_is_miscalibrated(state, finding):
+            reject("severity", "Finding severity is not calibrated to the PR type and evidence.")
+        if _is_generic_suggestion(str(suggestion)):
+            reject("suggestion", "Suggestion is too generic to be actionable.")
+
+    passed = not issues
+    retry_instruction = None
+    if not passed:
+        retry_instruction = (
+            "Regenerate findings so every finding is tied to the current PR, has concrete evidence, "
+            "uses calibrated severity, and includes a specific actionable suggestion."
+        )
+
+    return FindingGuardrailResult(
+        passed=passed,
+        issues=issues,
+        rejected_finding_indexes=sorted(rejected),
+        retry_instruction=retry_instruction,
+    )
+
+
+def _severity_is_miscalibrated(state: PRReviewState, finding) -> bool:
+    severity = _finding_value(finding, "severity", "")
+    relation = _finding_value(finding, "relation_to_pr", "")
+    text = (
+        f"{_finding_value(finding, 'issue', '')} "
+        f"{_finding_value(finding, 'evidence', '')} "
+        f"{_finding_value(finding, 'pr_relevance_reason', '')}"
+    ).lower()
+    summary = state.get("diff_summary")
+    docs_only = summary and summary.main_change_type == "docs_change"
+
+    if docs_only and severity in {"high", "critical"} and not any(
+        token in text for token in ["security", "secret", "credential", "broken", "production"]
+    ):
+        return True
+    if severity == "critical" and not any(
+        token in text for token in ["security", "data loss", "credential", "payment", "outage"]
+    ):
+        return True
+    if relation == "missing_test_for_changed_logic" and severity == "high" and not _is_high_risk_area(state):
+        return True
+    if any(token in text for token in ["style", "readability", "formatting"]) and severity in {"high", "critical"}:
+        return True
+    return False
+
+
+def _is_generic_suggestion(suggestion: str) -> bool:
+    normalized = suggestion.strip().lower().rstrip(".")
+    generic = {"fix this", "improve code", "add tests"}
+    return normalized in generic or len(normalized.split()) < 3
+
+
+def _is_high_risk_area(state: PRReviewState) -> bool:
+    summary = state.get("diff_summary")
+    risk = state.get("risk_summary")
+    area = summary.main_area.lower() if summary else ""
+    reasons = " ".join(risk.risk_reasons).lower() if risk else ""
+    return any(token in f"{area} {reasons}" for token in ["payment", "auth", "security"])
+
+
+def _calculate_confidence(state: PRReviewState, score: int) -> int:
+    confidence = 82 if not state.get("errors") else 65
+    if state.get("context_quality") and not state["context_quality"].context_enough:
+        confidence -= 15
+    if state.get("eval_result") and not state["eval_result"].passed:
+        confidence -= 15
+    if state.get("finding_guardrail_result") and not state["finding_guardrail_result"].passed:
+        confidence -= 10
+    if score < 50:
+        confidence -= 8
+    return max(0, min(100, confidence))
+
+
+def _build_score_breakdown(state: PRReviewState, score: int) -> ScoreBreakdown:
+    findings = state.get("findings", [])
+    high_count = sum(1 for finding in findings if finding.severity in {"high", "critical"})
+    missing_test_count = sum(1 for finding in findings if finding.relation_to_pr == "missing_test_for_changed_logic")
+    context_penalty = 10 if state.get("context_quality") and not state["context_quality"].context_enough else 0
+
+    return ScoreBreakdown(
+        code_quality=max(0, min(100, score + 5 - high_count * 5)),
+        test_coverage=max(0, min(100, 100 - missing_test_count * 25)),
+        goal_fit=max(0, min(100, 90 if state.get("pr_goal") else 80)),
+        security=max(0, min(100, 100 - high_count * 20)),
+        architecture_alignment=max(0, min(100, score - context_penalty)),
+    )
+
+
+def _run_score_guardrails(state: PRReviewState) -> ScoreGuardrailResult:
+    issues: list[GuardrailIssue] = []
+    score = state.get("overall_score", 0)
+    confidence = state.get("confidence", 0)
+    risk_level = state.get("risk_level", "")
+    recommendation = state.get("recommendation", "")
+    findings = state.get("findings", [])
+
+    def add_issue(reason: str) -> None:
+        issues.append(GuardrailIssue(guardrail_name="score_guardrail", reason=reason))
+
+    if not 0 <= score <= 100:
+        add_issue("overall_score must be between 0 and 100.")
+    if not 0 <= confidence <= 100:
+        add_issue("confidence must be between 0 and 100.")
+    if risk_level not in {"low", "medium", "high", "critical"}:
+        add_issue(f"Invalid risk_level: {risk_level}")
+    if recommendation not in {"merge_ready", "merge_with_caution", "fix_before_merge", "needs_human_review"}:
+        add_issue(f"Invalid recommendation: {recommendation}")
+    if state.get("score_breakdown"):
+        for name, value in state["score_breakdown"].model_dump().items():
+            if not 0 <= value <= 100:
+                add_issue(f"score_breakdown.{name} must be between 0 and 100.")
+    if any(finding.severity in {"high", "critical"} for finding in findings) and recommendation == "merge_ready":
+        add_issue("High or critical findings cannot be merge_ready.")
+    if state.get("eval_result") and not state["eval_result"].passed and confidence > 80:
+        add_issue("Failed eval cannot produce very high confidence.")
+    if state.get("context_quality") and not state["context_quality"].context_enough and confidence > 80:
+        add_issue("Weak context cannot produce very high confidence.")
+    if recommendation == "needs_human_review" and score > 75:
+        add_issue("needs_human_review should not have a very high score.")
+    if recommendation == "merge_ready" and score < 85:
+        add_issue("merge_ready should normally score at least 85.")
+
+    retry_instruction = None
+    if issues:
+        retry_instruction = "Recalculate score, confidence, risk level, and recommendation so they are consistent."
+    return ScoreGuardrailResult(passed=not issues, issues=issues, retry_instruction=retry_instruction)
+
+
 def _fallback_findings(state: PRReviewState) -> list[Finding]:
     files = state.get("changed_files", [])
     raw_diff = state.get("raw_diff", "").lower()
@@ -910,7 +1169,26 @@ def _review_prompt(state: PRReviewState) -> str:
         f"Risk summary: {state['risk_summary'].model_dump()}\n"
         f"Context quality: {state.get('context_quality').model_dump() if state.get('context_quality') else {}}\n"
         f"Retrieved context: {[_context_for_prompt(item) for item in state.get('retrieved_context', [])]}\n"
+        f"Review retry instruction: {state.get('review_retry_instruction') or ''}\n"
+        f"Eval improvement instruction: {state.get('eval_improvement_instruction') or ''}\n"
         f"PR goal: {state.get('pr_goal') or ''}\n"
+        f"Diff:\n{_trim_diff(state.get('raw_diff', ''))}"
+    )
+
+
+def _eval_prompt(state: PRReviewState) -> str:
+    return (
+        "Evaluate this PR review as structured EvalResult. Keep score between 0 and 100.\n"
+        "Pass only when findings are PR-related, evidence-backed, actionable, severity-calibrated, "
+        "and goal-aware when a PR goal exists. Retrieved context is supporting evidence only.\n"
+        f"PR goal: {state.get('pr_goal') or ''}\n"
+        f"Changed files: {[file.model_dump() for file in state.get('changed_files', [])]}\n"
+        f"Diff summary: {state['diff_summary'].model_dump()}\n"
+        f"Risk summary: {state['risk_summary'].model_dump()}\n"
+        f"Context quality: {state.get('context_quality').model_dump() if state.get('context_quality') else {}}\n"
+        f"Retrieved context: {[_context_for_prompt(item) for item in state.get('retrieved_context', [])]}\n"
+        f"Finding guardrail result: {_optional_model_dump(state.get('finding_guardrail_result'))}\n"
+        f"Findings: {[finding.model_dump() for finding in state.get('findings', [])]}\n"
         f"Diff:\n{_trim_diff(state.get('raw_diff', ''))}"
     )
 

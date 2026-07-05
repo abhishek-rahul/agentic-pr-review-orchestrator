@@ -5,6 +5,7 @@ from app.graph.workflow import build_review_graph
 from app.graph.nodes import context_quality_agent, rag_query_planner_agent, rag_retriever_node
 from app.graph.routers import route_after_context_quality
 from app.schemas.diff import DiffSummary, FileChangeSummary
+from app.schemas.eval import EvalResult
 from app.schemas.rag import ContextQualityResult, RAGQuery, RAGQueryPlan, RetrievedContext
 from app.schemas.finding import Finding, FindingList
 from app.schemas.pr import ChangedFile, PRMetadata
@@ -29,6 +30,7 @@ EXPECTED_TRACE = [
     ("S6A.9", "finding_guardrail_node"),
     ("S6A.10", "eval_judge_agent"),
     ("S6A.11", "final_scoring_agent"),
+    ("S6D.1", "score_guardrail_node"),
     ("S6A.12", "response_builder_node"),
 ]
 
@@ -46,6 +48,8 @@ class FakeStructuredLLM:
             return self.outputs["rag_query_plan"]
         if "ContextQualityResult" in prompt:
             return self.outputs["context_quality"]
+        if "EvalResult" in prompt:
+            return self.outputs["eval"]
         return self.outputs["findings"]
 
 
@@ -67,6 +71,8 @@ class FakeStructuredLLMForFallback:
                 missing_context=[],
                 suggested_queries=[],
             )
+        if "EvalResult" in prompt:
+            return EvalResult(score=90, passed=True, reason="Mock eval passed.")
         raise RuntimeError("Force review fallback")
 
 
@@ -130,6 +136,7 @@ def _mock_llm(monkeypatch, diff: DiffSummary, risk: RiskSummary, findings: list[
             missing_context=[],
             suggested_queries=[],
         ),
+        "eval": EvalResult(score=90, passed=True, reason="Mock eval passed."),
         "findings": FindingList(findings=findings),
     }
     monkeypatch.setattr("app.graph.nodes._get_structured_llm", lambda schema: FakeStructuredLLM(outputs))
@@ -238,6 +245,12 @@ def test_live_workflow_final_response_shape_and_trace():
         "findings",
         "trace",
         "errors",
+        "context_quality",
+        "finding_guardrail_result",
+        "eval_result",
+        "score_guardrail_result",
+        "score_breakdown",
+        "retry_count",
     }
     assert _trace_pairs(result) == EXPECTED_TRACE
     assert [(item["step_id"], item["agent_id"]) for item in response["trace"]] == EXPECTED_TRACE
@@ -554,6 +567,7 @@ def _run_with_docs_only() -> dict:
                 missing_context=[],
                 suggested_queries=[],
             ),
+            "eval": EvalResult(score=95, passed=True, reason="Mock eval passed."),
             "findings": FindingList(findings=[]),
         }
     )
