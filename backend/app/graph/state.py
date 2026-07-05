@@ -10,11 +10,13 @@ from app.schemas.trace import TraceStep
 
 
 class PRReviewState(TypedDict, total=False):
+    #initial stage me ye rhega 1
     request_id: str
     workflow_mode: Literal["skeleton"] | str
     pr_url: str
     pr_goal: str | None
 
+    # parse url + fetch data 
     pr_ref: PRRef
     owner: str
     repo: str
@@ -23,12 +25,14 @@ class PRReviewState(TypedDict, total=False):
     changed_files: list[ChangedFile]
     raw_diff: str
 
+    # Agents ka output
     diff_summary: DiffSummary
     risk_summary: RiskSummary
     rag_query_plan: RAGQueryPlan
     retrieved_context: list[RetrievedContext]
     context_quality: ContextQualityResult
 
+    # pr review k aput put + guar rails evals
     findings: list[Finding]
     guardrail_result: GuardrailStatus
     guardrails: GuardrailStatus
@@ -36,12 +40,13 @@ class PRReviewState(TypedDict, total=False):
     score_result: dict[str, Any]
     final_response: dict[str, Any]
 
+    # final scoring agent
     overall_score: int
     confidence: int
     risk_level: str
     recommendation: str
     final_summary: str
-
+    # initial stage me ye rhega 1
     retry_count: dict[str, int]
     errors: list[dict[str, str]]
     trace: list[TraceStep]
