@@ -21,3 +21,7 @@ class Finding(BaseModel):
     pr_relevance_reason: str
     relation_to_pr: PRRelation
     evidence: str = Field(..., min_length=3)
+
+
+class FindingList(BaseModel):
+    findings: list[Finding]

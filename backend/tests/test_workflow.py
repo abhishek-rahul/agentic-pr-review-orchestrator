@@ -16,6 +16,7 @@ from app.schemas.pr import ChangedFile
 def test_basic_node_flow_without_github_call():
     state = {
         "request_id": "test-request-1",
+        "workflow_mode": "skeleton",
         "pr_url": "https://github.com/org/repo/pull/1",
         "pr_goal": None,
         "changed_files": [ChangedFile(filename="app/service.py", status="modified")],
