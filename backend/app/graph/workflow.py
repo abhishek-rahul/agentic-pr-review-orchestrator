@@ -1,6 +1,11 @@
 from langgraph.graph import END, START, StateGraph
 
-from app.graph.routers import route_after_context_quality
+from app.graph.routers import (
+    route_after_context_quality,
+    route_after_eval,
+    route_after_finding_guardrail,
+    route_after_score_guardrail,
+)
 from app.graph.nodes import (
     context_quality_agent,
     diff_understanding_agent,
@@ -14,6 +19,7 @@ from app.graph.nodes import (
     rag_retriever_node,
     response_builder_node,
     risk_classification_agent,
+    score_guardrail_node,
 )
 from app.graph.state import PRReviewState
 
@@ -32,6 +38,7 @@ def build_review_graph():
     graph.add_node("finding_guardrail", finding_guardrail_node)
     graph.add_node("eval_judge", eval_judge_agent)
     graph.add_node("final_scoring", final_scoring_agent)
+    graph.add_node("score_guardrail", score_guardrail_node)
     graph.add_node("response_builder", response_builder_node)
 
     graph.add_edge(START, "parse_pr_url")
@@ -50,9 +57,31 @@ def build_review_graph():
         },
     )
     graph.add_edge("pr_review", "finding_guardrail")
-    graph.add_edge("finding_guardrail", "eval_judge")
-    graph.add_edge("eval_judge", "final_scoring")
-    graph.add_edge("final_scoring", "response_builder")
+    graph.add_conditional_edges(
+        "finding_guardrail",
+        route_after_finding_guardrail,
+        {
+            "pr_review": "pr_review",
+            "eval_judge": "eval_judge",
+        },
+    )
+    graph.add_conditional_edges(
+        "eval_judge",
+        route_after_eval,
+        {
+            "pr_review": "pr_review",
+            "final_scoring": "final_scoring",
+        },
+    )
+    graph.add_edge("final_scoring", "score_guardrail")
+    graph.add_conditional_edges(
+        "score_guardrail",
+        route_after_score_guardrail,
+        {
+            "final_scoring": "final_scoring",
+            "response_builder": "response_builder",
+        },
+    )
     graph.add_edge("response_builder", END)
 
     return graph.compile()
